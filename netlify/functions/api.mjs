@@ -6,16 +6,19 @@ const BOUNDS = { x0: -96000, x1: 80000, y0: -122000, y1: 86000 };
 const TRUCKY = { 'Simulation 1': 'sim1', 'Simulation 2': 'sim2', 'Arcade': 'arc1', 'ProMods': 'eupromods1', 'ProMods Arcade': 'eupromodsarc', '[US] Simulation': 'arc2', '[Asia] Simulation': 'sgpsim' };
 const mem = new Map(); // warm-instance cache
 
+let errs = []; // per-request diagnostics, returned only when data comes back empty
 async function getJSON(url, ms = 7000) {
   try {
     const r = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(ms) });
-    return r.ok ? await r.json() : null;
-  } catch { return null; }
+    if (r.ok) return await r.json();
+    errs.push({ url, status: r.status, body: (await r.text()).slice(0, 200) });
+    return null;
+  } catch (e) { errs.push({ url, error: String(e?.message || e) }); return null; }
 }
-async function cached(key, ttl, fn) {
+async function cached(key, ttl, fn, isEmpty) {
   const c = mem.get(key);
   if (c && Date.now() - c.t < ttl * 1000) return c.v;
-  const v = await fn(); mem.set(key, { t: Date.now(), v }); return v;
+  const v = await fn(); if (!isEmpty(v)) mem.set(key, { t: Date.now(), v }); return v;
 }
 
 // ---- servers ----
@@ -98,13 +101,15 @@ export default async (req) => {
   const net = u.searchParams.get('net') === 'haul' ? 'haul' : 'tmp';
   const server = (u.searchParams.get('server') || (net === 'haul' ? 'europe1' : '2')).replace(/[^a-zA-Z0-9_-]/g, '');
   const tsrv = (u.searchParams.get('trucky') || '').replace(/[^a-z0-9_]/g, '');
-  let body;
+  let body; errs = [];
   if (action === 'servers') {
-    const list = await cached('srv_' + net, 25, () => net === 'haul' ? haulServers() : tmpServers());
+    const list = await cached('srv_' + net, 25, () => net === 'haul' ? haulServers() : tmpServers(), v => !v.length);
     list.sort((a, b) => b.players - a.players);
     body = { net, servers: list, total: list.reduce((s, x) => s + x.players, 0) };
+    if (!list.length) body.debug = errs;
   } else if (action === 'hotspots') {
-    body = await cached(`hot_${net}_${server}_${tsrv}`, 20, () => hotspots(net, server, tsrv));
+    body = await cached(`hot_${net}_${server}_${tsrv}`, 20, () => hotspots(net, server, tsrv), v => v.source !== 'live');
+    if (body.source !== 'live') body = { ...body, debug: errs };
   } else if (action === 'cities') {
     body = CITIES;
   } else body = { error: 'bad action' };
